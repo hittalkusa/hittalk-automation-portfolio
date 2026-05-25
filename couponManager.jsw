@@ -1,0 +1,302 @@
+// backend/couponManager.jsw
+// Wix backend web module — all functions callable from page code
+
+import wixMarketingBackend from 'wix-marketing-backend';
+import { elevate } from 'wix-auth';
+import { currentMember } from 'wix-members-backend';
+import wixData from 'wix-data';
+
+// ─── CONFIG ─────────────────────────────────────────────────────────────────
+const COUPON_PERCENT_OFF = 50;
+const COUPON_USAGE_LIMIT = 1000;
+const COUPON_SCOPE       = { namespace: 'pricingPlans' };
+
+// ─── ELEVATED WRAPPERS ───────────────────────────────────────────────────────
+const createCouponElevated = elevate(wixMarketingBackend.coupons.createCoupon);
+const deleteCouponElevated = elevate(wixMarketingBackend.coupons.deleteCoupon);
+
+// ─── INTERNAL HELPERS ────────────────────────────────────────────────────────
+function slugToCode(slug) {
+  return slug.trim().toUpperCase();
+}
+
+async function findCouponByCode(code) {
+  try {
+    const results = await wixData.query('Marketing/Coupons')
+      .eq('code', code)
+      .find({ suppressAuth: true });
+    return results.items.length > 0 ? results.items[0] : null;
+  } catch (err) {
+    console.error('[couponManager] findCouponByCode error:', err);
+    return null;
+  }
+}
+
+async function deleteCouponById(couponId) {
+  try {
+    await deleteCouponElevated(couponId);
+    console.log('[couponManager] Deleted coupon:', couponId);
+  } catch (err) {
+    console.warn('[couponManager] deleteCoupon warn:', err);
+  }
+}
+
+// ─── COUPON FUNCTIONS ────────────────────────────────────────────────────────
+
+export async function createReferralCoupon(slug) {
+  if (!slug) return { success: false, error: 'No slug provided.' };
+  const code = slugToCode(slug);
+  const existing = await findCouponByCode(code);
+  if (existing) return { success: true, code, couponId: existing._id, alreadyExisted: true };
+  try {
+    const result = await createCouponElevated({
+      name:           `Artist Referral – ${code}`,
+      code:           code,
+      percentOffRate: COUPON_PERCENT_OFF,
+      usageLimit:     COUPON_USAGE_LIMIT,
+      startTime:      new Date(),
+      scope:          COUPON_SCOPE
+    });
+    console.log('[couponManager] Created coupon:', code, result);
+    return { success: true, code, couponId: result };
+  } catch (err) {
+    console.error('[couponManager] createReferralCoupon error:', err);
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+export async function replaceReferralCoupon(oldSlug, newSlug) {
+  if (!oldSlug || !newSlug) return { success: false, error: 'Both oldSlug and newSlug are required.' };
+  if (oldSlug.trim().toLowerCase() === newSlug.trim().toLowerCase()) return { success: true, skipped: true };
+  const oldCode   = slugToCode(oldSlug);
+  const oldCoupon = await findCouponByCode(oldCode);
+  if (oldCoupon) await deleteCouponById(oldCoupon._id);
+  else console.warn('[couponManager] No coupon found for old code:', oldCode);
+  const createResult = await createReferralCoupon(newSlug);
+  if (!createResult.success) return { success: false, oldCode, newCode: slugToCode(newSlug), error: `Old coupon deleted but failed to create new: ${createResult.error}` };
+  return { success: true, oldCode, newCode: createResult.code, couponId: createResult.couponId };
+}
+
+export async function deleteReferralCoupon(slug) {
+  if (!slug) return { success: false, error: 'No slug provided.' };
+  const code     = slugToCode(slug);
+  const existing = await findCouponByCode(code);
+  if (!existing) return { success: true, code, notFound: true };
+  await deleteCouponById(existing._id);
+  return { success: true, code };
+}
+
+export async function getReferralCouponInfo(slug) {
+  if (!slug) return { success: false, error: 'No slug provided.' };
+  const code   = slugToCode(slug);
+  const coupon = await findCouponByCode(code);
+  if (!coupon) return { success: false, code, notFound: true };
+  return {
+    success:    true,
+    code:       coupon.code,
+    couponId:   coupon._id,
+    name:       coupon.name,
+    percentOff: coupon.discountValue || 0,
+    usageLimit: coupon.usageLimit,
+    timesUsed:  coupon.numberOfUsages || 0,
+    startTime:  coupon.startTime,
+    active:     coupon.active
+  };
+}
+
+export async function updateMemberSlugBackend(newSlug) {
+  if (!newSlug) return { success: false, error: 'newSlug is required.' };
+  try {
+    await currentMember.updateSlug(newSlug);
+    console.log('[couponManager] Member slug updated to:', newSlug);
+    return { success: true };
+  } catch (err) {
+    console.error('[couponManager] updateMemberSlugBackend error:', err);
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+export async function getReferralStats(slug) {
+  if (!slug) return { success: false, error: 'No slug provided.' };
+  const code = slugToCode(slug);
+  const PLAN_CONFIG = {
+    cadet:     { keywords: ['cadet'],     commission: 0.625 },
+    astronaut: { keywords: ['astronaut'], commission: 2.50  },
+    ozone:     { keywords: ['ozone'],     commission: 6.25  }
+  };
+  try {
+    const result = await wixData.query('ArtistReferrals')
+      .eq('couponCode', code)
+      .contains('discountedItems', 'Pricing Plan')
+      .descending('_createdDate')
+      .find({ suppressAuth: true });
+
+    const counts    = { cadet: 0, astronaut: 0, ozone: 0 };
+    const referrals = [];
+    const tierRank  = { cadet: 1, astronaut: 2, ozone: 3 };
+
+    result.items.forEach(order => {
+      const item    = (order.discountedItems || '').toLowerCase();
+      const name    = order.customerName  || '';
+      const email   = (order.customerEmail || '').trim().toLowerCase();
+      const date    = order._createdDate  || null;
+      let planKey   = null;
+
+      for (const [key, config] of Object.entries(PLAN_CONFIG)) {
+        if (config.keywords.some(kw => item.includes(kw))) { planKey = key; break; }
+      }
+
+      if (planKey) {
+        counts[planKey]++;
+        const existing = referrals.findIndex(r => r.email && r.email === email);
+        const entry = {
+          name:    name  || 'Unknown',
+          email:   email || '',
+          plan:    planKey.charAt(0).toUpperCase() + planKey.slice(1),
+          rawPlan: planKey,
+          date:    date,
+          earn:    PLAN_CONFIG[planKey].commission,
+          memberId: '',
+          slug:     ''
+        };
+        if (existing === -1) {
+          referrals.push(entry);
+        } else {
+          if (tierRank[planKey] > tierRank[referrals[existing].rawPlan]) {
+            referrals[existing] = { ...referrals[existing], ...entry };
+          }
+        }
+      }
+    });
+
+    // Resolve member IDs and slugs by querying Members/PrivateMembersData
+    const emailsToLookup = referrals.filter(r => r.email).map(r => r.email);
+    if (emailsToLookup.length > 0) {
+      try {
+        const BATCH = 100;
+        const memberMap = {};
+
+        for (let i = 0; i < emailsToLookup.length; i += BATCH) {
+          const batch = emailsToLookup.slice(i, i + BATCH);
+          const memberResults = await wixData.query('Members/PrivateMembersData')
+            .hasSome('loginEmail', batch)
+            .find({ suppressAuth: true });
+
+          memberResults.items.forEach(m => {
+            const key = (m.loginEmail || '').trim().toLowerCase();
+            if (key) memberMap[key] = { memberId: m._id || '', slug: m.slug || '' };
+          });
+        }
+
+        referrals.forEach(r => {
+          if (r.email && memberMap[r.email]) {
+            r.memberId = memberMap[r.email].memberId;
+            r.slug     = memberMap[r.email].slug;
+          }
+        });
+
+        console.log(`[couponManager] Resolved ${Object.keys(memberMap).length} member IDs for referrals`);
+      } catch (lookupErr) {
+        console.warn('[couponManager] Member ID lookup failed (non-fatal):', lookupErr);
+      }
+    }
+
+    const earnings = {
+      cadet:     counts.cadet     * PLAN_CONFIG.cadet.commission,
+      astronaut: counts.astronaut * PLAN_CONFIG.astronaut.commission,
+      ozone:     counts.ozone     * PLAN_CONFIG.ozone.commission
+    };
+    const totalReferrals = counts.cadet + counts.astronaut + counts.ozone;
+    const totalEarnings  = earnings.cadet + earnings.astronaut + earnings.ozone;
+
+    console.log(`[couponManager] getReferralStats for ${code}:`, counts, '→ $' + totalEarnings.toFixed(2));
+    return { success: true, code, counts, earnings, totalReferrals, totalEarnings, orders: result.items.length, referrals };
+  } catch (err) {
+    console.error('[couponManager] getReferralStats error:', err);
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+export async function checkSlugAvailable(slug, currentMemberId) {
+  if (!slug) return { success: false, error: 'No slug provided.' };
+  try {
+    const result = await wixData.query('Members/PrivateMembersData')
+      .eq('slug', slug.trim().toLowerCase())
+      .find({ suppressAuth: true });
+    const takenByOther = result.items.some(item => item._id !== currentMemberId);
+    return { success: true, available: !takenByOther };
+  } catch (err) {
+    console.error('[couponManager] checkSlugAvailable error:', err);
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+// ─── MEMBER LOOKUP (used for Profile + Chat buttons) ─────────────────────────
+export async function getMemberProfileByEmail(email) {
+  if (!email) return { success: false, slug: null, memberId: null };
+  try {
+    const result = await wixData.query('Members/PrivateMembersData')
+      .eq('loginEmail', email.trim().toLowerCase())
+      .find({ suppressAuth: true });
+    if (result.items.length > 0) {
+      return {
+        success:  true,
+        slug:     result.items[0].slug || null,
+        memberId: result.items[0]._id  || null
+      };
+    }
+    return { success: true, slug: null, memberId: null };
+  } catch (err) {
+    console.error('[couponManager] getMemberProfileByEmail error:', err);
+    return { success: false, slug: null, memberId: null };
+  }
+}
+
+// ─── PAYOUT INFO ─────────────────────────────────────────────────────────────
+export async function savePayoutInfo(memberId, cashapp, venmo, paypal) {
+  if (!memberId) return { success: false, error: 'memberId is required.' };
+
+  let activeMethod = '';
+  if (cashapp)       activeMethod = 'cashapp';
+  else if (venmo)    activeMethod = 'venmo';
+  else if (paypal)   activeMethod = 'paypal';
+
+  try {
+    const existing = await wixData.get('Members/FullData', memberId, { suppressAuth: true });
+    if (!existing) return { success: false, error: 'Member record not found.' };
+
+    const updated = {
+      ...existing,
+      _id:                     memberId,
+      custom_cashapp:          cashapp  || existing.custom_cashapp  || '',
+      custom_venmo:            venmo    || existing.custom_venmo    || '',
+      custom_paypal:           paypal   || existing.custom_paypal   || '',
+      'custom_payment-method': activeMethod
+    };
+
+    await wixData.update('Members/FullData', updated, { suppressAuth: true });
+    console.log('[couponManager] Payout info saved for member:', memberId, { activeMethod, cashapp, venmo, paypal });
+    return { success: true, activeMethod };
+  } catch (err) {
+    console.error('[couponManager] savePayoutInfo error:', err);
+    return { success: false, error: err.message || String(err) };
+  }
+}
+
+export async function getPayoutInfo(memberId) {
+  if (!memberId) return { success: false, error: 'memberId is required.' };
+  try {
+    const item = await wixData.get('Members/FullData', memberId, { suppressAuth: true });
+    if (!item) return { success: true, cashapp: '', venmo: '', paypal: '', activeMethod: '' };
+    return {
+      success:      true,
+      cashapp:      item.custom_cashapp           || '',
+      venmo:        item.custom_venmo             || '',
+      paypal:       item.custom_paypal            || '',
+      activeMethod: item['custom_payment-method'] || ''
+    };
+  } catch (err) {
+    console.error('[couponManager] getPayoutInfo error:', err);
+    return { success: false, error: err.message || String(err), cashapp: '', venmo: '', paypal: '', activeMethod: '' };
+  }
+}
