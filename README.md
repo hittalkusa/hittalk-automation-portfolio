@@ -16,12 +16,30 @@ Make.com workflow that automates artist report generation:
 - Calculates Momentum Score and engagement metrics
 - Delivers reports via Wix Chat and social media comments
 
-### `ffmpegProcessor.js`
-Node.js server (via ngrok) that processes audio files:
-- Downloads tracks from Google Drive
-- Applies FFmpeg effects (normalize, crossfade, ID3 tagging)
-- Uploads processed files back to shared drive
-- Integrates with Apple Music via AppleScript
+### `processor.js`
+Production Node.js server handling audio/video processing for Hit Talk platform. Runs locally via ngrok and processes requests from Wix frontend.
+
+**Features:**
+- **Audio mixer engine** with EQ, compression, reverb, crossfade (FFmpeg)
+- **Google Drive API** integration for file storage and retrieval
+- **Multi-track mixtape processing** (up to 7 tracks with crossfade)
+- **ID3 tagging** and Apple Music auto-import via AppleScript
+- **Social clip generation** (9:16 vertical video with blur pad backgrounds)
+- **Job queue system** with status tracking and downloadable outputs
+
+**API Endpoints:**
+- `POST /api/tag-mp3` — Download, tag, and save MP3 with cover art
+- `POST /api/mixtape` — Multi-track crossfade mixer (gated to paid tiers)
+- `POST /api/social-clip` — Generate 25-second vertical video audiogram
+- `POST /api/full-clip` — Full-length video with waveform visualization
+- `GET /api/status/:jobId` — Check processing status
+- `GET /api/download/:jobId` — Stream completed files
+
+**Tech:**
+- FFmpeg for audio/video processing
+- Google Drive API (OAuth service account)
+- AppleScript for macOS Music.app integration
+- CORS-enabled REST API via ngrok tunnel
 
 ## Tech Stack
 
